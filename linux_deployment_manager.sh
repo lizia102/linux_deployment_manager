@@ -1,78 +1,116 @@
 #!/bin/bash
 
-# 检查是否以root权限运行
-if [ "$EUID" -ne 0 ]; then
-  echo "请以root权限运行此脚本"
-  exit 1
+# 配置文件路径
+CONFIG_FILE="config.ini"
+
+# 日志文件路径
+LOG_FILE="/var/log/deployment_manager.log"
+
+# 加载配置文件
+if [ -f "$CONFIG_FILE" ]; then
+    source "$CONFIG_FILE"
+else
+    echo "配置文件 $CONFIG_FILE 不存在，将使用默认值"
 fi
 
-# 设置变量
-SERVER_NAME="your_server_name.com"  # 请替换为您的服务器域名
-SERVER_IP="your_server_ip"  # 请替换为您的服务器IP地址
-NETWORK="192.168.1.0"  # 请替换为您的网络地址
-NETMASK="255.255.255.0"  # 请替换为您的子网掩码
-RANGE_START="192.168.1.100"  # DHCP地址池起始
-RANGE_END="192.168.1.200"  # DHCP地址池结束
-ROUTER="192.168.1.1"  # 请替换为您的路由器IP
+# 设置默认值
+SERVER_NAME=${SERVER_NAME:-"your_server_name_or_ip"}
+RHEL9_ISO=${RHEL9_ISO:-"/path/to/rhel9.iso"}
+RHEL10_ISO=${RHEL10_ISO:-"/path/to/rhel10.iso"}
+SLES15_ISO=${SLES15_ISO:-"/path/to/sles15.iso"}
+DOMAIN_NAME=${DOMAIN_NAME:-"example.com"}
+NETWORK=${NETWORK:-"192.168.1.0/24"}
 
-# 函数：安装基本软件包
-install_packages() {
-    # 对于RHEL/CentOS系统
-    if [ -f /etc/redhat-release ]; then
-        dnf install -y httpd mod_ssl tftp-server syslinux grub2-efi-x64 shim-x64 openssl bind bind-utils dhcp-server
-    # 对于SUSE系统
-    elif [ -f /etc/SuSE-release ] || [ -f /etc/SUSE-brand ]; then
-        zypper install -y apache2 tftp grub2-x86_64-efi shim openssl bind dhcp-server syslinux
+# 日志函数
+log_message() {
+    echo "$(date '+%Y-%m-%d %H:%M:%S') - $1" >> "$LOG_FILE"
+}
+
+# 执行命令并记录日志
+execute_command() {
+    "$@"
+    if [ $? -ne 0 ]; then
+        log_message "错误: 执行 $1 失败"
+        echo "错误: 执行 $1 失败，请查看日志 $LOG_FILE"
+        return 1
     else
-        echo "不支持的操作系统"
+        log_message "成功: 执行 $1"
+        return 0
+    fi
+}
+
+# 权限检查
+check_root() {
+    if [ "$(id -u)" != "0" ]; then
+        echo "此脚本需要 root 权限运行"
         exit 1
     fi
 }
 
-# 函数：配置RHEL服务器
+# 安装基本软件包
+install_packages() {
+    if [ -f /etc/redhat-release ]; then
+        execute_command dnf update -y
+        execute_command dnf install -y httpd dhcp-server bind tftp-server syslinux
+    elif [ -f /etc/SuSE-release ] || [ -f /etc/SUSE-brand ]; then
+        execute_command zypper refresh
+        execute_command zypper install -y apache2 dhcp-server bind tftp syslinux
+    else
+        echo "不支持的操作系统"
+        exit 1
+    fi
+    log_message "基本软件包已安装"
+}
+
+# 配置 RHEL 服务器
 configure_rhel_servers() {
     local version=$1
     local http_root="/var/www/html/rhel$version"
     local https_root="/var/www/html/rhel$version-secure"
     local tftp_root="/var/lib/tftpboot"
-    local iso_path="/path/to/rhel$version.iso"  # 请确保ISO文件存在
+    local iso_path
 
-    # 配置HTTP服务器
-    mkdir -p $http_root
-    mount -o loop $iso_path $http_root
+    if [ "$version" == "9" ]; then
+        iso_path="$RHEL9_ISO"
+    elif [ "$version" == "10" ]; then
+        iso_path="$RHEL10_ISO"
+    else
+        echo "不支持的 RHEL 版本"
+        return 1
+    fi
 
-    # 为HTTP Boot配置GRUB
-    mkdir -p $http_root/boot/grub2
-    cp /boot/efi/EFI/redhat/grubx64.efi $http_root/boot/grub2/
-    cp /boot/grub2/fonts/unicode.pf2 $http_root/boot/grub2/
+    # 检查 ISO 文件是否存在
+    if [ ! -f "$iso_path" ]; then
+        echo "ISO 文件不存在: $iso_path"
+        return 1
+    fi
 
-    # 创建GRUB配置文件
-    cat << EOF > $http_root/boot/grub2/grub.cfg
-set timeout=60
+    # 挂载 ISO
+    if ! mountpoint -q $http_root; then
+        mkdir -p $http_root
+        execute_command mount -o loop $iso_path $http_root
+    fi
 
-menuentry 'Install Red Hat Enterprise Linux $version (HTTP)' --class fedora --class gnu-linux --class gnu --class os {
-    linuxefi /images/pxeboot/vmlinuz inst.stage2=http://${SERVER_NAME}${http_root} inst.repo=http://${SERVER_NAME}${http_root}
-    initrdefi /images/pxeboot/initrd.img
-}
-
-menuentry 'Install Red Hat Enterprise Linux $version (HTTPS)' --class fedora --class gnu-linux --class gnu --class os {
-    linuxefi /images/pxeboot/vmlinuz inst.stage2=https://${SERVER_NAME}${https_root} inst.repo=https://${SERVER_NAME}${https_root}
-    initrdefi /images/pxeboot/initrd.img
-}
-EOF
-
-    # 配置HTTPS服务器
+    # 配置 HTTPS 服务器
     mkdir -p $https_root
     cp -R $http_root/* $https_root/
 
-    # 配置TFTP服务器（用于PXE）
-    mkdir -p $tftp_root/{boot,EFI/BOOT}
-    cp /boot/efi/EFI/redhat/shimx64.efi $tftp_root/EFI/BOOT/BOOTX64.EFI
-    cp /boot/efi/EFI/redhat/grubx64.efi $tftp_root/EFI/BOOT/grubx64.efi
+    # 生成自签名 SSL 证书（如果不存在）
+    if [ ! -f /etc/pki/tls/private/server.key ] || [ ! -f /etc/pki/tls/certs/server.crt ]; then
+        mkdir -p /etc/pki/tls/private /etc/pki/tls/certs
+        execute_command openssl req -x509 -nodes -days 365 -newkey rsa:2048 \
+          -keyout /etc/pki/tls/private/server.key \
+          -out /etc/pki/tls/certs/server.crt \
+          -subj "/CN=$SERVER_NAME"
+    fi
 
-    # 创建PXE的GRUB配置文件
-    cat << EOF > $tftp_root/EFI/BOOT/grub.cfg
-set timeout=60
+    # 配置 TFTP 服务器（用于 PXE）
+    mkdir -p $tftp_root/{EFI/BOOT,boot}
+    cp $http_root/EFI/BOOT/BOOTX64.EFI $tftp_root/EFI/BOOT/
+    cp $http_root/images/pxeboot/{vmlinuz,initrd.img} $tftp_root/boot/
+
+    # 创建或追加 GRUB 配置
+    cat << EOF >> $tftp_root/EFI/BOOT/grub.cfg
 
 menuentry 'Install Red Hat Enterprise Linux $version (HTTP PXE)' --class fedora --class gnu-linux --class gnu --class os {
     linuxefi /boot/vmlinuz inst.stage2=http://${SERVER_NAME}${http_root} inst.repo=http://${SERVER_NAME}${http_root}
@@ -85,196 +123,253 @@ menuentry 'Install Red Hat Enterprise Linux $version (HTTPS PXE)' --class fedora
 }
 EOF
 
-    # 复制内核和initrd到TFTP目录
-    cp $http_root/images/pxeboot/{vmlinuz,initrd.img} $tftp_root/boot/
+    # 配置 HTTP Boot
+    mkdir -p $http_root/EFI/BOOT
+    cp $tftp_root/EFI/BOOT/{BOOTX64.EFI,grub.cfg} $http_root/EFI/BOOT/
+
+    # 配置 HTTPS Boot
+    mkdir -p $https_root/EFI/BOOT
+    cp $tftp_root/EFI/BOOT/{BOOTX64.EFI,grub.cfg} $https_root/EFI/BOOT/
+
+    log_message "RHEL $version 服务器配置完成"
 }
 
-# 函数：配置SLES服务器
+# 配置 SLES 服务器
 configure_sles_servers() {
     local version=$1
-    local http_root="/srv/www/htdocs/sles$version"
-    local https_root="/srv/www/htdocs/sles$version-secure"
-    local tftp_root="/srv/tftpboot"
-    local iso_path="/path/to/sles$version.iso"  # 请确保ISO文件存在
+    local http_root="/var/www/html/sles$version"
+    local https_root="/var/www/html/sles$version-secure"
+    local tftp_root="/var/lib/tftpboot"
+    local iso_path="$SLES15_ISO"
 
-    # 配置HTTP服务器
-    mkdir -p $http_root
-    mount -o loop $iso_path $http_root
+    # 检查 ISO 文件是否存在
+    if [ ! -f "$iso_path" ]; then
+        echo "ISO 文件不存在: $iso_path"
+        return 1
+    fi
 
-    # 配置HTTPS服务器
+    # 挂载 ISO
+    if ! mountpoint -q $http_root; then
+        mkdir -p $http_root
+        execute_command mount -o loop $iso_path $http_root
+    fi
+
+    # 配置 HTTPS 服务器
     mkdir -p $https_root
     cp -R $http_root/* $https_root/
 
-    # 配置TFTP服务器（用于PXE）
-    mkdir -p $tftp_root/{EFI/BOOT,boot/x86_64/loader}
-    cp /usr/share/grub2/x86_64-efi/grub.efi $tftp_root/EFI/BOOT/bootx64.efi
-    cp $http_root/boot/x86_64/loader/linux $tftp_root/boot/x86_64/loader/
-    cp $http_root/boot/x86_64/loader/initrd $tftp_root/boot/x86_64/loader/
+    # 配置 TFTP 服务器（用于 PXE）
+    mkdir -p $tftp_root/{EFI/BOOT,boot}
+    cp $http_root/EFI/BOOT/BOOTX64.EFI $tftp_root/EFI/BOOT/
+    cp $http_root/boot/x86_64/{linux,initrd} $tftp_root/boot/
 
-    # 创建PXE的GRUB配置文件
-    cat << EOF > $tftp_root/EFI/BOOT/grub.cfg
-set timeout=10
-menuentry 'Install SUSE Linux Enterprise Server $version (HTTP)' {
-    linuxefi /boot/x86_64/loader/linux install=http://${SERVER_NAME}${http_root}
-    initrdefi /boot/x86_64/loader/initrd
+    # 创建或追加 GRUB 配置
+    cat << EOF >> $tftp_root/EFI/BOOT/grub.cfg
+
+menuentry 'Install SUSE Linux Enterprise Server $version (HTTP PXE)' --class suse --class gnu-linux --class gnu --class os {
+    linuxefi /boot/linux install=http://${SERVER_NAME}${http_root}
+    initrdefi /boot/initrd
 }
-menuentry 'Install SUSE Linux Enterprise Server $version (HTTPS)' {
-    linuxefi /boot/x86_64/loader/linux install=https://${SERVER_NAME}${https_root}
-    initrdefi /boot/x86_64/loader/initrd
+
+menuentry 'Install SUSE Linux Enterprise Server $version (HTTPS PXE)' --class suse --class gnu-linux --class gnu --class os {
+    linuxefi /boot/linux install=https://${SERVER_NAME}${https_root}
+    initrdefi /boot/initrd
 }
 EOF
 
-    # 配置HTTP Boot
+    # 配置 HTTP Boot
     mkdir -p $http_root/EFI/BOOT
-    cp $tftp_root/EFI/BOOT/{bootx64.efi,grub.cfg} $http_root/EFI/BOOT/
+    cp $tftp_root/EFI/BOOT/{BOOTX64.EFI,grub.cfg} $http_root/EFI/BOOT/
 
-    # 配置HTTPS Boot
+    # 配置 HTTPS Boot
     mkdir -p $https_root/EFI/BOOT
-    cp $tftp_root/EFI/BOOT/{bootx64.efi,grub.cfg} $https_root/EFI/BOOT/
+    cp $tftp_root/EFI/BOOT/{BOOTX64.EFI,grub.cfg} $https_root/EFI/BOOT/
 
-    # 生成自签名SSL证书（如果不存在）
-    if [ ! -f /etc/apache2/ssl.key/server.key ] || [ ! -f /etc/apache2/ssl.crt/server.crt ]; then
-        mkdir -p /etc/apache2/ssl.key /etc/apache2/ssl.crt
-        openssl req -x509 -nodes -days 365 -newkey rsa:2048 \
-          -keyout /etc/apache2/ssl.key/server.key \
-          -out /etc/apache2/ssl.crt/server.crt \
-          -subj "/CN=$SERVER_NAME"
-    fi
+    log_message "SLES $version 服务器配置完成"
 }
 
-# 函数：配置Apache
+# 配置 Apache
 configure_apache() {
+    local config_file
+    local ssl_cert
+    local ssl_key
+
     if [ -f /etc/redhat-release ]; then
-        # 对于RHEL/CentOS系统
-        cat << EOF > /etc/httpd/conf.d/boot.conf
-<VirtualHost *:80>
-    ServerName $SERVER_NAME
-    DocumentRoot /var/www/html
-</VirtualHost>
-
-<VirtualHost *:443>
-    ServerName $SERVER_NAME
-    DocumentRoot /var/www/html
-    SSLEngine on
-    SSLCertificateFile /etc/pki/tls/certs/server.crt
-    SSLCertificateKeyFile /etc/pki/tls/private/server.key
-</VirtualHost>
-EOF
-        systemctl restart httpd
+        config_file="/etc/httpd/conf.d/boot.conf"
+        ssl_cert="/etc/pki/tls/certs/server.crt"
+        ssl_key="/etc/pki/tls/private/server.key"
     elif [ -f /etc/SuSE-release ] || [ -f /etc/SUSE-brand ]; then
-        # 对于SUSE系统
-        cat << EOF > /etc/apache2/vhosts.d/boot.conf
+        config_file="/etc/apache2/vhosts.d/boot.conf"
+        ssl_cert="/etc/apache2/ssl.crt/server.crt"
+        ssl_key="/etc/apache2/ssl.key/server.key"
+    else
+        echo "不支持的操作系统"
+        return 1
+    fi
+
+    # 备份现有配置
+    [ -f $config_file ] && cp $config_file ${config_file}.bak
+
+    # 创建或覆盖 Apache 配置
+    cat << EOF > $config_file
 <VirtualHost *:80>
     ServerName $SERVER_NAME
-    DocumentRoot /srv/www/htdocs
+    DocumentRoot /var/www/html
 </VirtualHost>
 
 <VirtualHost *:443>
     ServerName $SERVER_NAME
-    DocumentRoot /srv/www/htdocs
+    DocumentRoot /var/www/html
     SSLEngine on
-    SSLCertificateFile /etc/apache2/ssl.crt/server.crt
-    SSLCertificateKeyFile /etc/apache2/ssl.key/server.key
+    SSLCertificateFile $ssl_cert
+    SSLCertificateKeyFile $ssl_key
 </VirtualHost>
 EOF
-        a2enmod ssl
-        systemctl restart apache2
+
+    # 重启 Apache 服务
+    if [ -f /etc/redhat-release ]; then
+        sed -i 's/^#LoadModule ssl_module/LoadModule ssl_module/' /etc/httpd/conf.modules.d/00-ssl.conf
+        execute_command systemctl restart httpd
+    elif [ -f /etc/SuSE-release ] || [ -f /etc/SUSE-brand ]; then
+        execute_command a2enmod ssl
+        execute_command systemctl restart apache2
     fi
+
+    log_message "Apache 配置完成"
 }
 
-
-# 函数：配置DNS服务器
+# 配置 DNS
 configure_dns() {
-    cat << EOF > /etc/named.conf
+    local config_file="/etc/named.conf"
+    local zone_file="/var/named/forward.zone"
+
+    # 备份现有配置
+    [ -f $config_file ] && cp $config_file ${config_file}.bak
+    [ -f $zone_file ] && cp $zone_file ${zone_file}.bak
+
+    # 配置 named.conf
+    cat << EOF > $config_file
 options {
-    listen-on port 53 { 127.0.0.1; ${SERVER_IP}; };
-    directory       "/var/named";
-    dump-file       "/var/named/data/cache_dump.db";
-    statistics-file "/var/named/data/named_stats.txt";
-    memstatistics-file "/var/named/data/named_mem_stats.txt";
-    allow-query     { localhost; ${NETWORK}/${NETMASK}; };
-    recursion yes;
-    dnssec-enable yes;
-    dnssec-validation yes;
+    listen-on port 53 { any; };
+    directory "/var/named";
+    allow-query { any; };
+    forwarders { 8.8.8.8; 8.8.4.4; };
 };
 
-zone "${SERVER_NAME}" IN {
+zone "$DOMAIN_NAME" IN {
     type master;
-    file "named.${SERVER_NAME}";
-    allow-update { none; };
+    file "forward.zone";
 };
 EOF
 
-    cat << EOF > /var/named/named.${SERVER_NAME}
+    # 配置 zone 文件
+    cat << EOF > $zone_file
 \$TTL 86400
-@   IN  SOA     ${SERVER_NAME}. root.${SERVER_NAME}. (
-        2023011800  ;Serial
+@   IN  SOA     ns1.$DOMAIN_NAME. admin.$DOMAIN_NAME. (
+        $(date +%Y%m%d01)  ;Serial
         3600        ;Refresh
         1800        ;Retry
         604800      ;Expire
         86400       ;Minimum TTL
 )
-        IN  NS      ${SERVER_NAME}.
-        IN  A       ${SERVER_IP}
+    IN  NS      ns1.$DOMAIN_NAME.
+    IN  A       $SERVER_NAME
+
+ns1 IN  A       $SERVER_NAME
 EOF
 
-    chown root:named /etc/named.conf /var/named/named.${SERVER_NAME}
-    chmod 640 /etc/named.conf /var/named/named.${SERVER_NAME}
+    # 重启 named 服务
+    execute_command systemctl restart named
 
-    systemctl restart named
+    log_message "DNS 服务器配置完成"
 }
 
-# 函数：配置DHCP服务器
+# 配置 DHCP
 configure_dhcp() {
-    cat << EOF > /etc/dhcp/dhcpd.conf
-option space pxelinux;
-option pxelinux.magic code 208 = string;
-option pxelinux.configfile code 209 = text;
-option pxelinux.pathprefix code 210 = text;
-option pxelinux.reboottime code 211 = unsigned integer 32;
+    local config_file="/etc/dhcp/dhcpd.conf"
 
-subnet ${NETWORK} netmask ${NETMASK} {
-  range ${RANGE_START} ${RANGE_END};
-  option routers ${ROUTER};
-  option domain-name-servers ${SERVER_IP};
-  option domain-name "${SERVER_NAME}";
-  
-  class "pxeclients" {
-    match if substring (option vendor-class-identifier, 0, 9) = "PXEClient";
-    next-server ${SERVER_IP};
-    
-    if option arch = 00:07 {
-      filename "EFI/BOOT/bootx64.efi";
-    } else {
-      filename "pxelinux.0";
-    }
-  }
+    # 备份现有配置
+    [ -f $config_file ] && cp $config_file ${config_file}.bak
+
+    # 从 NETWORK 变量中提取网段和掩码
+    local subnet=$(echo $NETWORK | cut -d'/' -f1)
+    local prefix=$(echo $NETWORK | cut -d'/' -f2)
+    local netmask=$(ipcalc -m $NETWORK | cut -d'=' -f2)
+
+    # 配置 DHCP 服务器
+    cat << EOF > $config_file
+option domain-name "$DOMAIN_NAME";
+option domain-name-servers $SERVER_NAME;
+
+default-lease-time 600;
+max-lease-time 7200;
+
+subnet $subnet netmask $netmask {
+    range $subnet.100 $subnet.200;
+    option routers $subnet.1;
+    option broadcast-address $subnet.255;
+    next-server $SERVER_NAME;
+    filename "EFI/BOOT/BOOTX64.EFI";
 }
 EOF
 
-    systemctl restart dhcpd
+    # 重启 DHCP 服务
+    execute_command systemctl restart dhcpd
+
+    log_message "DHCP 服务器配置完成"
 }
 
-# 函数：配置防火墙
+# 配置防火墙
 configure_firewall() {
     if command -v firewall-cmd &> /dev/null; then
-        firewall-cmd --permanent --add-service=http
-        firewall-cmd --permanent --add-service=https
-        firewall-cmd --permanent --add-service=tftp
-        firewall-cmd --permanent --add-service=dns
-        firewall-cmd --permanent --add-service=dhcp
-        firewall-cmd --reload
-    elif command -v SuSEfirewall2 &> /dev/null; then
-        SuSEfirewall2 open EXT TCP http
-        SuSEfirewall2 open EXT TCP https
-        SuSEfirewall2 open EXT UDP tftp
-        SuSEfirewall2 open EXT TCP dns
-        SuSEfirewall2 open EXT UDP dns
-        SuSEfirewall2 open EXT UDP dhcp
-        SuSEfirewall2 start
+        execute_command firewall-cmd --permanent --add-service=http
+        execute_command firewall-cmd --permanent --add-service=https
+        execute_command firewall-cmd --permanent --add-service=dns
+        execute_command firewall-cmd --permanent --add-service=dhcp
+        execute_command firewall-cmd --permanent --add-service=tftp
+        execute_command firewall-cmd --reload
+    elif command -v ufw &> /dev/null; then
+        execute_command ufw allow http
+        execute_command ufw allow https
+        execute_command ufw allow dns
+        execute_command ufw allow 67/udp
+        execute_command ufw allow 69/udp
+        execute_command ufw reload
     else
-        echo "未找到支持的防火墙管理工具"
+        echo "未检测到支持的防火墙，请手动配置防火墙规则。"
     fi
+
+    log_message "防火墙配置完成"
+}
+
+# 配置 TFTP 服务
+configure_tftp() {
+    if [ -f /etc/redhat-release ]; then
+        execute_command systemctl enable tftp.socket
+        execute_command systemctl start tftp.socket
+    elif [ -f /etc/SuSE-release ] || [ -f /etc/SUSE-brand ]; then
+        execute_command systemctl enable tftp.service
+        execute_command systemctl start tftp.service
+    fi
+    log_message "TFTP 服务配置完成"
+}
+
+# 显示帮助信息
+show_help() {
+    echo "Linux 部署管理系统帮助"
+    echo "----------------------"
+    echo "1. 安装基本软件包: 安装 HTTP、DHCP、DNS、TFTP 等服务"
+    echo "2. 部署 RHEL 9: 配置 RHEL 9 的 PXE 启动环境"
+    echo "3. 部署 RHEL 10: 配置 RHEL 10 的 PXE 启动环境"
+    echo "4. 部署 SLES 15: 配置 SLES 15 的 PXE 启动环境"
+    echo "5. 配置 Apache: 设置 HTTP/HTTPS 虚拟主机"
+    echo "6. 配置 DNS 服务器: 设置域名解析"
+    echo "7. 配置 DHCP 服务器: 配置 IP 地址分配"
+    echo "8. 配置防火墙: 开放必要的端口"
+    echo "9. 配置 TFTP 服务: 设置 TFTP 服务"
+    echo "10. 退出"
+    echo ""
+    echo "注意: 使用此脚本前，请确保已准备好相应的 ISO 文件"
 }
 
 # 主菜单
@@ -289,8 +384,10 @@ main_menu() {
         echo "6. 配置 DNS 服务器"
         echo "7. 配置 DHCP 服务器"
         echo "8. 配置防火墙"
-        echo "9. 退出"
-        read -p "请选择操作 (1-9): " choice
+        echo "9. 配置 TFTP 服务"
+        echo "10. 显示帮助信息"
+        echo "11. 退出"
+        read -p "请选择操作 (1-11): " choice
 
         case $choice in
             1) install_packages ;;
@@ -301,7 +398,9 @@ main_menu() {
             6) configure_dns ;;
             7) configure_dhcp ;;
             8) configure_firewall ;;
-            9) exit 0 ;;
+            9) configure_tftp ;;
+            10) show_help ;;
+            11) exit 0 ;;
             *) echo "无效选择，请重试。" ;;
         esac
 
@@ -310,6 +409,6 @@ main_menu() {
     done
 }
 
-
-# 运行主菜单
+# 脚本入口
+check_root
 main_menu
